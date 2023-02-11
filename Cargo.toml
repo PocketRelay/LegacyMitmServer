@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT"
 authors = ["Jacobtread <jacobtread@gmail.com>"]
 repository = "https://github.com/PocketRelay/MitmServer"
+description = "Man-In-The-Middle server for Pocket Relay development and testing"
 
 [dependencies]
 # Blaze packet system 
