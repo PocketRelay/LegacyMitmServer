@@ -59,8 +59,11 @@ const REDIRECT_COMPONENT: Components = Components::Redirector(Redirector::GetSer
 async fn handle_client(accept: BlazeAccept) -> io::Result<()> {
     let (mut stream, addr) = match accept.finish_accept().await {
         Ok(value) => value,
-        Err(_) => {
-            error!("Unable to establish SSL connection within redirector");
+        Err(err) => {
+            error!(
+                "Unable to establish SSL connection within redirector: {:?}",
+                err
+            );
             return Ok(());
         }
     };

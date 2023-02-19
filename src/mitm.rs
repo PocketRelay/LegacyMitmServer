@@ -2,13 +2,12 @@
 //! to the correct address for the main server.
 
 use blaze_pk::packet::{Packet, PacketDebug};
-use blaze_ssl_async::stream::BlazeStream;
 use log::{debug, error, info};
-use std::{io, sync::Arc};
+use std::sync::Arc;
 use tokio::{
-    io::AsyncWriteExt,
-    net::{TcpListener, TcpStream},
-    select,
+    io::{split, AsyncRead, AsyncWrite, AsyncWriteExt, ReadHalf},
+    net::TcpListener,
+    sync::mpsc,
 };
 
 use crate::{components::Components, retriever::Retriever, MAIN_PORT};
@@ -35,7 +34,7 @@ pub async fn start_server(retriever: Arc<Retriever>) {
 
     // Accept incoming connections
     loop {
-        let (stream, addr) = match listener.accept().await {
+        let (stream, _) = match listener.accept().await {
             Ok(value) => value,
             Err(err) => {
                 error!("Failed to accept MITM connection: {err:?}");
@@ -44,43 +43,89 @@ pub async fn start_server(retriever: Arc<Retriever>) {
         };
         let retriever = retriever.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_client(stream, retriever).await {
-                error!("Unable to handle MITM (Addr: {addr}): {err}");
-            }
+            let server = match retriever.stream().await {
+                Some(stream) => stream,
+                None => {
+                    error!("MITM unable to connect to official server");
+                    return;
+                }
+            };
+
+            let (client_reader, client_writer) = split(stream);
+            let client_writer = Writer::start(client_writer);
+
+            let (server_reader, server_writer) = split(server);
+            let server_writer = Writer::start(server_writer);
+
+            Reader::spawn(client_reader, server_writer, "Client");
+            Reader::spawn(server_reader, client_writer, "Server");
         });
     }
 }
 
-/// Handles dealing with a redirector client
-///
-/// `stream`   The stream to the client
-/// `addr`     The client address
-/// `instance` The server instance information
-/// `shutdown` Async safely shutdown reciever
-async fn handle_client(mut client: TcpStream, retriever: Arc<Retriever>) -> io::Result<()> {
-    let mut server = match retriever.stream().await {
-        Some(stream) => stream,
-        None => {
-            error!("MITM unable to connect to official server");
-            return Ok(());
+/// Writer for writing packets to a connection
+struct Writer<W> {
+    rx: mpsc::UnboundedReceiver<Packet>,
+    write: W,
+}
+
+impl<W> Writer<W>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    pub fn start(write: W) -> WriterAddr {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let writer = Writer { rx, write };
+        tokio::spawn(writer.process());
+        WriterAddr(tx)
+    }
+
+    pub async fn process(mut self) {
+        while let Some(packet) = self.rx.recv().await {
+            if let Err(err) = packet.write_async(&mut self.write).await {
+                error!("Error while write: {:?}", err)
+            }
+            if let Err(err) = self.write.flush().await {
+                error!("Error while flushing: {:?}", err);
+            }
         }
-    };
-    loop {
-        select! {
-            // Read packets coming from the client
-            result = Packet::read_async_typed::<Components, TcpStream>(&mut client) => {
-                let (component, packet) = result?;
-                debug_log_packet(&component, &packet, "From Client");
-                packet.write_async(&mut server).await?;
-                server.flush().await?;
-            }
-            // Read packets from the official server
-            result = Packet::read_async_typed::<Components, BlazeStream>(&mut server) => {
-                let (component, packet) = result?;
-                debug_log_packet(&component, &packet, "From Server");
-                packet.write_async(&mut client).await?;
-            }
-        };
+    }
+}
+
+#[derive(Clone)]
+struct WriterAddr(mpsc::UnboundedSender<Packet>);
+
+struct Reader<R> {
+    /// Reader to read the packets from
+    read: R,
+    /// Writer to send the packets to
+    writer: WriterAddr,
+
+    side: &'static str,
+}
+
+impl<R> Reader<R>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    pub fn spawn(read: R, writer: WriterAddr, side: &'static str) {
+        let reader = Reader { read, writer, side };
+        tokio::spawn(reader.process());
+    }
+
+    pub async fn process(mut self) {
+        loop {
+            let (component, packet) =
+                match Packet::read_async_typed::<Components, R>(&mut self.read).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        error!("Error while reading: {:?}", err);
+                        break;
+                    }
+                };
+            debug_log_packet(&component, &packet, self.side);
+            self.writer.0.send(packet).ok();
+        }
     }
 }
 
@@ -90,11 +135,11 @@ async fn handle_client(mut client: TcpStream, retriever: Arc<Retriever>) -> io::
 /// `component` The component for the packet routing
 /// `packet`    The packet that is being logged
 /// `direction` The direction name for the packet
-fn debug_log_packet(component: &Components, packet: &Packet, direction: &str) {
+fn debug_log_packet(component: &Components, packet: &Packet, side: &str) {
     let debug = PacketDebug {
         packet,
         component,
         minified: false,
     };
-    debug!("\nRecieved Packet {}\n{:?}", direction, debug);
+    debug!("\nRecieved Packet From {}\n{:?}", side, debug);
 }
